@@ -51,10 +51,11 @@ class RMSNorm:
     return (x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight
 
 class Attention:
-  def __init__(self, dim, n_heads):
+  def __init__(self, dim, n_heads, dropout_prob=None):
     self.wq, self.wk, self.wv, self.wo = [Linear(dim, dim, bias=False) for _ in range(4)]
     self.n_heads = n_heads
     self.head_dim = dim // n_heads
+    self.dropout_prob = dropout_prob
 
   def prepare_attention(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -83,6 +84,8 @@ class Attention:
     if mask is not None:
       scores = scores + mask
     scores = scores.softmax()  # this is casted to float
+    if self.dropout_prob is not None:
+      scores = scores.dropout(self.dropout_prob)
     return scores.matmul(values).transpose(1, 2).reshape(bsz, seqlen, -1)
 
   # NOTE: this is not called
@@ -92,21 +95,25 @@ class Attention:
     return self.wo(output)
 
 class FeedForward:
-  def __init__(self, dim, hidden_dim, multiple_of):
+  def __init__(self, dim, hidden_dim, multiple_of, dropout_prob=None):
     # TODO: what is this?
     hidden_dim = int(2 * hidden_dim / 3)
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     self.w1 = Linear(dim, hidden_dim, bias=False)
     self.w2 = Linear(hidden_dim, dim, bias=False)
     self.w3 = Linear(dim, hidden_dim, bias=False)
+    self.dropout_prob = dropout_prob
 
   def __call__(self, x:Tensor) -> Tensor:
-    return self.w2(self.w1(x).silu() * self.w3(x))
+    output = self.w2(self.w1(x).silu() * self.w3(x))
+    if self.dropout_prob is not None:
+      output = output.dropout(self.dropout_prob)
+    return output
 
 class TransformerBlock:
-  def __init__(self, dim, multiple_of, n_heads, norm_eps):
-    self.attention = Attention(dim, n_heads)
-    self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
+  def __init__(self, dim, multiple_of, n_heads, norm_eps, hidden_dropout_prob=None, attention_dropout_prob=None):
+    self.attention = Attention(dim, n_heads, dropout_prob=attention_dropout_prob)
+    self.feed_forward = FeedForward(dim, 4*dim, multiple_of, dropout_prob=hidden_dropout_prob)
     self.attention_norm = RMSNorm(dim, norm_eps)
     self.ffn_norm = RMSNorm(dim, norm_eps)
     if getenv("JIT"):
@@ -130,12 +137,32 @@ class TransformerBlock:
     return self._post(x, output)
 
 class Transformer:
-  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=1024):
-    self.layers = [TransformerBlock(dim, multiple_of, n_heads, norm_eps) for _ in range(n_layers)]
+  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=1024, attention_dropout_prob=None, hidden_dropout_prob=None):
+    self.layers = [TransformerBlock(dim, multiple_of, n_heads, norm_eps, hidden_dropout_prob=hidden_dropout_prob, attention_dropout_prob=attention_dropout_prob) for _ in range(n_layers)]
     self.norm = RMSNorm(dim, norm_eps)
     self.tok_embeddings = Embedding(vocab_size, dim)
     self.output = Linear(dim, vocab_size, bias=False)
     self.freqs_cis = Tensor(precompute_freqs_cis(dim // n_heads, max_seq_len * 2))
+
+  def fix_state(state):
+    def fix_key(orig):
+      k = "^" + orig
+      k = k.replace("^model.", "^")
+      k = k.replace("^embed_tokens.", "^tok_embeddings.")
+      k = k.replace("^lm_head.", "^output.")
+      k = k.replace(".self_attn.q_proj.", ".attention.wq.")
+      k = k.replace(".self_attn.k_proj.", ".attention.wk.")
+      k = k.replace(".self_attn.v_proj.", ".attention.wv.")
+      k = k.replace(".self_attn.o_proj.", ".attention.wo.")
+      k = k.replace(".mlp.gate_proj.", ".feed_forward.w1.")
+      k = k.replace(".mlp.down_proj.", ".feed_forward.w2.")
+      k = k.replace(".mlp.up_proj.", ".feed_forward.w3.")
+      k = k.replace(".input_layernorm.", ".attention_norm.")
+      k = k.replace(".post_attention_layernorm.", ".ffn_norm.")
+      k = k.replace("^", "")
+      print(f"transformed {orig} -> {k}")
+      return k
+    return {fix_key(k): v for k,v in state.items() if not k.endswith(".inv_freq")}
 
   def __call__(self, tokens:Tensor, start_pos:int):
     _bsz, seqlen = tokens.shape
@@ -165,6 +192,10 @@ VOCAB_SIZE = 32000
 args_small = {"dim": 512, "multiple_of": 256, "n_heads": 8, "n_layers": 8, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE}
 
 args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
+args_open_llama_7B = args_7B | {"hidden_dropout_prob": 0.1, "attention_dropout_prob": 0.1}
+args_open_llama_7B_2k = args_open_llama_7B | {"max_seq_len": 2048}
+args_open_llama_7B_4k = args_open_llama_7B | {"max_seq_len": 4096}
+args_open_llama_7B_8k = args_open_llama_7B | {"max_seq_len": 8192}
 WEIGHTS_7B_FILENAME = WEIGHTS_DIR / "7B/consolidated.00.pth"
 
 # TODO: make this model work
@@ -201,8 +232,7 @@ if __name__ == "__main__":
   parser.add_argument('--temperature', type=float, default=0.7, help="Temperature in the softmax")
   parser.add_argument('--timing', action='store_true', help="Print timing per token")
   parser.add_argument('--profile', action='store_true', help="Output profile data to out.prof")
-  parser.add_argument('--large', action='store_true', help="Use the 13B model instead of the 7B one")
-  parser.add_argument('--tinyfake', action='store_true', help="Use the fake very small model")
+  parser.add_argument('--model', default='llama_7b', choices=['llama_7b', 'open_llama_7b', 'open_llama_7b_8k', 'llama_13b', 'tinyfake'])
   args = parser.parse_args()
   chatbot = args.prompt == None
 
@@ -210,7 +240,7 @@ if __name__ == "__main__":
   # load model (you have to find the weights yourself)
   from extra.utils import fake_torch_load_zipped, get_child
 
-  if args.large:
+  if args.model == 'llama_13b':
     model = Transformer(**args_13B)
     with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
       weights0 = fake_torch_load_zipped(open(WEIGHTS_13B_0_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1))
@@ -245,7 +275,7 @@ if __name__ == "__main__":
 
     del weights0
     del weights1
-  elif args.tinyfake:
+  elif args.model == 'tinyfake':
     # GRAPH=1 python3 examples/llama.py --timing --prompt "Hello." --temperature=0 --tinyfake --count 1
     model = Transformer(**args_small)
     from tinygrad.nn.optim import get_parameters
@@ -265,9 +295,17 @@ if __name__ == "__main__":
   """
 
   # disktensor loader isn't fast yet
-  model = Transformer(**args_7B)
+  model = Transformer(**{
+    'llama_7b': args_7B,
+    'open_llama_7b': args_open_llama_7B,
+    'open_llama_7b_2k': args_open_llama_7B_2k,
+    'open_llama_7b_4k': args_open_llama_7B_4k,
+    'open_llama_7b_8k': args_open_llama_7B_8k,
+    'tinyfake': args_small,
+    # 'llama_13b': args_13B,
+  }[args.model])
   from tinygrad.state import torch_load, load_state_dict
-  load_state_dict(model, torch_load(WEIGHTS_7B_FILENAME), strict=False)
+  load_state_dict(model, Transformer.fix_state(torch_load(WEIGHTS_7B_FILENAME)), strict=False)
 
   # *** prompt engineers work here ****
 
