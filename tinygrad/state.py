@@ -43,12 +43,14 @@ def get_state_dict(obj, prefix:str='', tensor_type=Tensor) -> Dict[str, Tensor]:
   return state_dict
 def get_parameters(obj) -> List[Tensor]: return list(get_state_dict(obj).values())
 
-def load_state_dict(model, state_dict, strict=True):
+def load_state_dict(model, state_dict, strict=True, transform_key=lambda k: k):
   with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
     model_state_dict = get_state_dict(model)
-    if DEBUG >= 1 and len(state_dict) > len(model_state_dict): print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - model_state_dict.keys())))
+    if DEBUG >= 1 and set(state_dict.keys()) != set(map(transform_key, model_state_dict.keys())): print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - map(transform_key, model_state_dict.keys()))))
     for k,v in (t := tqdm(model_state_dict.items())):
       t.set_description(f"ram used: {GlobalCounters.mem_used/1e9:5.2f} GB, {k:50s}")
+      k = transform_key(k)
+      if k is None: continue
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
@@ -56,7 +58,7 @@ def load_state_dict(model, state_dict, strict=True):
 
 # torch support!
 
-def torch_load(fn:str):
+def _torch_load(fn:str):
   t = Tensor.empty(os.stat(fn).st_size, dtype=dtypes.uint8, device=f"disk:{fn}")
 
   offsets: Dict[str, int] = {}
@@ -110,3 +112,16 @@ def torch_load(fn:str):
         base_offset += 8 + lens[i]
       f.seek(rwd)
       return TorchPickle(f).load()
+    
+def torch_load(fn:str):
+  try:
+    _torch_load(fn)
+  except:
+    print('# Failed to load model, trying to convert to float32 using torch...')
+    import torch
+    values = torch.load(fn, map_location=torch.device('cpu'))
+    for k, v in values.items():
+      values[k] = Tensor(v.float().numpy())
+      del v
+    return values
+

@@ -52,12 +52,12 @@ class RMSNorm:
 
 class Attention:
   def __init__(self, dim, n_heads):
-    self.wq, self.wk, self.wv, self.wo = [Linear(dim, dim, bias=False) for _ in range(4)]
+    self.q_proj, self.k_proj, self.v_proj, self.o_proj = [Linear(dim, dim, bias=False) for _ in range(4)]
     self.n_heads = n_heads
     self.head_dim = dim // n_heads
 
   def prepare_attention(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+    xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
     xq, xk, xv = [x.reshape(x.shape[0], x.shape[1], self.n_heads, self.head_dim) for x in (xq, xk, xv)]
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
     return xq, xk, xv
@@ -89,26 +89,29 @@ class Attention:
   def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
     xq, xk, xv = self.prepare_attention(x, freqs_cis)
     output = self.inner_attention(xq, xk, xv, start_pos, mask)
-    return self.wo(output)
+    return self.o_proj(output)
 
 class FeedForward:
   def __init__(self, dim, hidden_dim, multiple_of):
-    # TODO: what is this?
-    hidden_dim = int(2 * hidden_dim / 3)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    self.w1 = Linear(dim, hidden_dim, bias=False)
-    self.w2 = Linear(hidden_dim, dim, bias=False)
-    self.w3 = Linear(dim, hidden_dim, bias=False)
+    if hidden_dim is None:
+      hidden_dim = dim * 4
+      # TODO: what is this?
+      hidden_dim = int(2 * hidden_dim / 3)
+      hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+      
+    self.gate_proj = Linear(dim, hidden_dim, bias=False)
+    self.down_proj = Linear(hidden_dim, dim, bias=False)
+    self.up_proj = Linear(dim, hidden_dim, bias=False)
 
   def __call__(self, x:Tensor) -> Tensor:
-    return self.w2(self.w1(x).silu() * self.w3(x))
+    return self.down_proj(self.gate_proj(x).silu() * self.up_proj(x))
 
 class TransformerBlock:
-  def __init__(self, dim, multiple_of, n_heads, norm_eps):
-    self.attention = Attention(dim, n_heads)
-    self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
-    self.attention_norm = RMSNorm(dim, norm_eps)
-    self.ffn_norm = RMSNorm(dim, norm_eps)
+  def __init__(self, dim, hidden_dim, multiple_of, n_heads, norm_eps):
+    self.self_attn = Attention(dim, n_heads)
+    self.mlp = FeedForward(dim, hidden_dim, multiple_of)
+    self.input_layernorm = RMSNorm(dim, norm_eps)
+    self.post_attention_layernorm = RMSNorm(dim, norm_eps)
     if getenv("JIT"):
       self._pre = TinyJit(self.pre)
       self._post = TinyJit(self.post)
@@ -116,30 +119,30 @@ class TransformerBlock:
       self._pre, self._post = self.pre, self.post
 
   def pre(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    xq, xk, xv = self.attention.prepare_attention(self.attention_norm(x), freqs_cis)
+    xq, xk, xv = self.self_attn.prepare_attention(self.input_layernorm(x), freqs_cis)
     return xq.realize(), xk.realize(), xv.realize()
 
   def post(self, x:Tensor, output:Tensor) -> Tensor:
-    h = x + self.attention.wo(output)
-    return (h + self.feed_forward(self.ffn_norm(h))).realize()
+    h = x + self.self_attn.o_proj(output)
+    return (h + self.mlp(self.post_attention_layernorm(h))).realize()
 
   def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]):
     xq, xk, xv = self._pre(x, freqs_cis)
     # inner_attention can't be jitted because it's dynamic based on start_pos
-    output = self.attention.inner_attention(xq, xk, xv, start_pos, mask)
+    output = self.self_attn.inner_attention(xq, xk, xv, start_pos, mask)
     return self._post(x, output)
 
 class Transformer:
-  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=1024):
-    self.layers = [TransformerBlock(dim, multiple_of, n_heads, norm_eps) for _ in range(n_layers)]
+  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, hidden_dim=None, max_batch_size=32, max_seq_len=1024):
+    self.layers = [TransformerBlock(dim, hidden_dim, multiple_of, n_heads, norm_eps) for _ in range(n_layers)]
     self.norm = RMSNorm(dim, norm_eps)
-    self.tok_embeddings = Embedding(vocab_size, dim)
-    self.output = Linear(dim, vocab_size, bias=False)
+    self.embed_tokens = Embedding(vocab_size, dim)
+    self.lm_head = Linear(dim, vocab_size, bias=False)
     self.freqs_cis = Tensor(precompute_freqs_cis(dim // n_heads, max_seq_len * 2))
 
   def __call__(self, tokens:Tensor, start_pos:int):
     _bsz, seqlen = tokens.shape
-    h = self.tok_embeddings(tokens)
+    h = self.embed_tokens(tokens)
 
     # get only the part we are using. making it contiguous avoids more kernel calls
     freqs_cis = self.freqs_cis[:, start_pos:start_pos+seqlen].contiguous().realize()
@@ -154,7 +157,7 @@ class Transformer:
       h.realize()  # TODO: why do i need this?
       h = layer(h, start_pos, freqs_cis, mask)
 
-    return self.output(self.norm(h)[:, -1, :])
+    return self.lm_head(self.norm(h)[:, -1, :])
 
 # **** files and arguments ****
 
@@ -163,14 +166,15 @@ TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
 VOCAB_SIZE = 32000
 
 args_small = {"dim": 512, "multiple_of": 256, "n_heads": 8, "n_layers": 8, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE}
+args_3B    = {"dim": 3200, "multiple_of": 256, "n_heads": 32, "hidden_dim":  8640, "n_layers": 26, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
 
-args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-WEIGHTS_7B_FILENAME = WEIGHTS_DIR / "7B/consolidated.00.pth"
+args_7B    = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "hidden_dim": 11008, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
+args_7B_2k = args_7B | {"max_seq_len": 2048}
+args_7B_4k = args_7B | {"max_seq_len": 4096}
+args_7B_8k = args_7B | {"max_seq_len": 8192}
 
 # TODO: make this model work
 args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-WEIGHTS_13B_0_FILENAME = WEIGHTS_DIR / "13B/consolidated.00.pth"
-WEIGHTS_13B_1_FILENAME = WEIGHTS_DIR / "13B/consolidated.01.pth"
 
 # **** helper functions ****
 def sample(logits, temperature):
@@ -187,12 +191,9 @@ def sample(logits, temperature):
 if __name__ == "__main__":
   Tensor.no_grad = True
   print(f"using {Device.DEFAULT} backend")
-  from sentencepiece import SentencePieceProcessor
-  sp_model = SentencePieceProcessor(model_file=str(TOKENIZER_FILENAME))
-  assert sp_model.vocab_size() == VOCAB_SIZE
 
   parser = argparse.ArgumentParser(description='Run LLaMA 7B in tinygrad', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-  # test: python3 examples/llama.py --prompt="Hello." --temperature=0
+  # test: python3 examples/llama.py --prompt="Hello." --temperature=0 --size=7b weights/LLaMA/7B/consolidated.00.pth
   # Hello. I'm a 20 year old male. I'm a student at the University of Texas at Austin. I'm a sophomore majoring in Computer Science.
   parser.add_argument('--prompt', type=str, default=None, help="Phrase to start with. Without this, it goes into chatbot mode")
   parser.add_argument('--count', type=int, default=1000, help="Max number of tokens to generate")
@@ -201,20 +202,27 @@ if __name__ == "__main__":
   parser.add_argument('--temperature', type=float, default=0.7, help="Temperature in the softmax")
   parser.add_argument('--timing', action='store_true', help="Print timing per token")
   parser.add_argument('--profile', action='store_true', help="Output profile data to out.prof")
-  parser.add_argument('--large', action='store_true', help="Use the 13B model instead of the 7B one")
-  parser.add_argument('--tinyfake', action='store_true', help="Use the fake very small model")
+  parser.add_argument('--tokenizer', default=str(TOKENIZER_FILENAME))
+  parser.add_argument('--size', default='7b', choices=['3b', '7b', '7b_2k', '7b_4k', '7b_8k', '13b', 'tinyfake'])
+  parser.add_argument('weights', nargs=argparse.REMAINDER, help="The binary model file(s) to load")
   args = parser.parse_args()
   chatbot = args.prompt == None
+
+  from sentencepiece import SentencePieceProcessor
+  sp_model = SentencePieceProcessor(model_file=args.tokenizer)
+  assert sp_model.vocab_size() == VOCAB_SIZE
 
   """
   # load model (you have to find the weights yourself)
   from extra.utils import fake_torch_load_zipped, get_child
 
-  if args.large:
+  if args.size == '13b':
+    assert len(args.weights) == 2, "Please specify two weights files"
+  
     model = Transformer(**args_13B)
     with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
-      weights0 = fake_torch_load_zipped(open(WEIGHTS_13B_0_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1))
-      weights1 = fake_torch_load_zipped(open(WEIGHTS_13B_1_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1))
+      weights0 = fake_torch_load_zipped(open(args.weights[0], "rb"), load_weights=getenv("WEIGHTS", 1))
+      weights1 = fake_torch_load_zipped(open(args.weights[1], "rb"), load_weights=getenv("WEIGHTS", 1))
     # eww, this makes a copy
     print("concatenating weights")
     from tqdm import tqdm
@@ -245,7 +253,8 @@ if __name__ == "__main__":
 
     del weights0
     del weights1
-  elif args.tinyfake:
+  elif args.size == 'tinyfake':
+    assert len(args.weights) == 1, "Please specify a weights file"
     # GRAPH=1 python3 examples/llama.py --timing --prompt "Hello." --temperature=0 --tinyfake --count 1
     model = Transformer(**args_small)
     from tinygrad.nn.optim import get_parameters
@@ -264,10 +273,26 @@ if __name__ == "__main__":
     del weights
   """
 
+  assert len(args.weights) == 1, "Please specify a weights file"
+
   # disktensor loader isn't fast yet
-  model = Transformer(**args_7B)
+  model = Transformer(**{
+    'tinyfake': args_small,
+    '3b': args_3B,
+    '7b': args_7B,
+    '7b_2k': args_7B_2k,
+    '7b_4k': args_7B_4k,
+    '7b_8k': args_7B_8k,
+    '13b': args_13B,
+  }[args.size.lower()])
+
+  def get_model_key(k):
+    if k == 'freqs_cis': return None
+    if k == 'lm_head.weight': return k
+    return 'model.' + k
+
   from tinygrad.state import torch_load, load_state_dict
-  load_state_dict(model, torch_load(WEIGHTS_7B_FILENAME), strict=False)
+  load_state_dict(model, torch_load(args.weights[0]), strict=True, transform_key=get_model_key)
 
   # *** prompt engineers work here ****
 
